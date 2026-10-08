@@ -1,0 +1,74 @@
+# Copy to config.yaml and fill in your endpoints.
+#   cp config.example.yaml config.yaml
+
+embedder:
+  type: titan                         # titan | hash (hash = offline stand-in)
+  model_id: amazon.titan-embed-text-v2:0
+  region: us-east-1                   # region where you have Bedrock model access (can differ from OpenSearch)
+  profile: null                       # optional AWS profile name
+  dimensions: 1024                    # Titan v2: 256 | 512 | 1024  (must match the index mapping; the framework sets both)
+  normalize: true
+  workers: 8                          # concurrent Bedrock calls; run `embed-bench` to find your quota ceiling
+  cache_path: .cache/embeddings.sqlite
+
+# Settings shared by every OpenSearch target; each target overrides what it needs.
+target_defaults:
+  index: sim-cases
+  engine: faiss
+  space_type: innerproduct            # use innerproduct with normalized Titan vectors (or cosinesimil)
+  m: 16
+  ef_construction: 128
+  ef_search: 100
+  bulk_size: 500
+  bulk_workers: 8
+
+targets:
+  # OpenSearch Service domain ("OSS cluster")
+  managed:
+    kind: opensearch
+    endpoint: https://search-YOURDOMAIN-xxxxxxxx.ap-south-1.es.amazonaws.com
+    region: ap-south-1
+    service: es
+    auth: sigv4                       # or: basic  (reads OS_USER / OS_PASS env vars)
+    shards: 6
+    replicas: 1
+    id_mode: custom
+
+  # OpenSearch Serverless vector-search collection ("next gen collection")
+  serverless:
+    kind: opensearch
+    endpoint: https://xxxxxxxxxxxx.ap-south-1.aoss.amazonaws.com
+    region: ap-south-1
+    service: aoss
+    auth: sigv4
+    id_mode: auto                     # try `custom` first if your collection accepts custom ids; `auto` is the safe default
+    # ef_search: null                 # uncomment if the collection rejects the index-level ef_search setting
+    # post_create_wait: 15            # seconds to wait after creating the index
+
+  # Optional: exact in-memory target, handy to sanity-check the framework itself
+  local:
+    kind: local
+
+data:
+  corpus: data/corpus.jsonl           # existing cases   {"id": "...", "text": "..."}
+  new_cases: data/new_cases.jsonl     # new cases        (+ optional "expected_neighbor": "<existing id>")
+  updates: data/updates.jsonl         # updated cases    {"id": "<existing id>", "text": "<new text>"}
+  queries: data/dataset_a.jsonl       # 2nd dataset for `match` (+ optional "expected_match": "<corpus id>")
+
+run:
+  k: 10
+  n_queries: 200
+  visibility_timeout: 60              # seconds to wait for a write to become searchable
+  visibility_sample: 20               # how many new/updated cases get individual time-to-searchable timing
+
+# Pass/fail limits. Tune to your requirements; remove a line to skip that check.
+thresholds:
+  recall_at_k: 0.90
+  existing_exact_hit_at_1: 0.99
+  existing_perturbed_hit_at_k: 0.95
+  new_post_index_hit_at_1: 0.99
+  new_neighbor_hit_at_k: 0.80
+  updated_hit_at_1: 0.99
+  time_to_searchable_p95_s: 30
+  load_max_p99_ms: 500
+  load_max_error_rate: 0.01

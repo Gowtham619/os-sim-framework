@@ -1,0 +1,20 @@
+# Offline dry-run config: hash embedder + in-memory target. No AWS needed.
+# Use it to try the framework end to end:  python -m simtest run -c config.local.yaml -t local
+embedder:
+  type: hash
+  dimensions: 256
+  cache_path: .cache/hash-embeddings.sqlite
+
+targets:
+  local:
+    kind: local
+
+run:
+  n_queries: 100
+  visibility_sample: 10
+  delete_sample: 10
+
+thresholds:
+  # The hash embedder is lexical, not semantic, so re-worded cases only loosely resemble their originals.
+  # With Titan embeddings keep the stricter defaults from config.example.yaml.
+  new_neighbor_hit_at_k: 0.4

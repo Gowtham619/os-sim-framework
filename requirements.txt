@@ -1,0 +1,6 @@
+numpy>=1.24
+pyyaml>=6.0
+boto3>=1.34
+opensearch-py>=2.4
+requests>=2.31
+pytest>=7.4

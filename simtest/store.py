@@ -269,7 +269,7 @@ def build_client(cfg: dict):
         connection_class=RequestsHttpConnection,
         pool_maxsize=int(cfg.get("pool_maxsize", 64)),
         timeout=int(cfg.get("timeout", 60)),
-        max_retries=3,
+        max_retries=int(cfg.get("max_retries", 3)),
         retry_on_timeout=True,
         **kwargs,
     )

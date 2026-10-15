@@ -70,6 +70,42 @@ class Workbench:
         stats["docs_per_sec"] = round(stats["indexed"] / stats["seconds"], 1) if stats.get("seconds") else None
         return stats
 
+    def ingest_streaming(
+        self,
+        records: list[dict],
+        recreate: bool = True,
+        start: int = 0,
+        chunk_size: int = 2000,
+        on_chunk: Optional[Callable[[int, int, dict], None]] = None,
+    ) -> dict:
+        """Embed and index `records` chunk by chunk, so memory stays flat and a failure can resume at a chunk boundary.
+
+        Does not fill the in-memory mirror (only the scenarios need it). Stops at the first chunk with indexing errors
+        without calling `on_chunk` for it, so a checkpoint never moves past data that was not indexed.
+        """
+        self.store.create_index(recreate=recreate)
+        total = {"indexed": 0, "errors": 0, "throttled": 0, "retries": 0, "seconds": 0.0, "stopped_at": None}
+        t0 = time.perf_counter()
+        for i in range(start, len(records), chunk_size):
+            chunk = records[i : i + chunk_size]
+            vecs = self.embedder.embed_many([r["text"] for r in chunk])
+            docs = [
+                Doc(r["id"], r["text"], v, 1, {k: val for k, val in r.items() if k not in _EVAL_ONLY_KEYS})
+                for r, v in zip(chunk, vecs)
+            ]
+            res = self.store.bulk_index(docs)
+            for key in ("indexed", "errors", "throttled", "retries"):
+                total[key] += res[key]
+            if res["errors"]:
+                total["stopped_at"] = i
+                break
+            if on_chunk:
+                on_chunk(i + len(chunk), len(records), total)
+        total["seconds"] = time.perf_counter() - t0
+        self.store.refresh()
+        total["docs_per_sec"] = round(total["indexed"] / total["seconds"], 1) if total["seconds"] else None
+        return total
+
     # -- query helpers ---------------------------------------------------------------------------
     def sample_ids(self, n: int) -> list[str]:
         ids = sorted(self.mirror.ids())

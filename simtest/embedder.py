@@ -47,6 +47,10 @@ class EmbeddingCache:
             row = self.conn.execute("SELECT v FROM emb WHERE k=?", (key,)).fetchone()
         return None if row is None else np.frombuffer(row[0], dtype=np.float32).copy()
 
+    def has(self, key: str) -> bool:
+        with self.lock:
+            return self.conn.execute("SELECT 1 FROM emb WHERE k=?", (key,)).fetchone() is not None
+
     def put(self, key: str, vec: np.ndarray) -> None:
         with self.lock:
             self.conn.execute(

@@ -185,3 +185,55 @@ def test_match_writes_csv_and_scores_labelled_matches(sample, tmp_path):
     wb2 = make_wb(sample, os_store(FakeOS(), service="es"))
     m2 = run_match(wb2, recs, k=5, min_sim=0.0, out_csv=str(tmp_path / "m2.csv"), batch=16, workers=2, log=lambda x: None)
     assert m2["hit_at_k"] == m["hit_at_k"]
+
+
+# -- chunked ingest ---------------------------------------------------------------------------------
+def _stream_wb(fake):
+    from simtest.config import load_config
+    from simtest.embedder import HashEmbedder
+    from simtest.scenarios import Workbench
+    from simtest.store import OpenSearchStore
+
+    cfg = load_config(None)
+    store = OpenSearchStore({"index": "i", "id_mode": "custom", "backoff_base": 0, "post_create_wait": 0, "bulk_size": 3}, 32, client=fake)
+    return Workbench(cfg, store, HashEmbedder(dim=32))
+
+
+def test_ingest_streaming_indexes_in_chunks_and_resumes():
+    from fakes import FakeOS
+
+    recs = [{"id": f"c{i}", "text": f"case number {i} about topic {i % 5}", "status": "open"} for i in range(10)]
+    fake = FakeOS()
+    seen = []
+    wb = _stream_wb(fake)
+    stats = wb.ingest_streaming(recs, chunk_size=4, on_chunk=lambda d, t, s: seen.append(d))
+    assert seen == [4, 8, 10] and stats["indexed"] == 10 and len(fake.docs) == 10
+    assert all(d["status"] == "open" for d in fake.docs.values())
+
+    # resume from a checkpoint: no recreate, only the remaining cases are written
+    fake2 = FakeOS()
+    wb2 = _stream_wb(fake2)
+    wb2.ingest_streaming(recs[:4], chunk_size=4)
+    stats = wb2.ingest_streaming(recs, recreate=False, start=4, chunk_size=4)
+    assert stats["indexed"] == 6 and len(fake2.docs) == 10
+
+
+def test_ingest_streaming_stops_without_advancing_checkpoint_on_errors(monkeypatch):
+    from fakes import FakeOS
+
+    recs = [{"id": f"c{i}", "text": f"case {i}"} for i in range(8)]
+    wb = _stream_wb(FakeOS())
+    real = wb.store.bulk_index
+    calls = {"n": 0}
+
+    def flaky(docs, progress=False):
+        calls["n"] += 1
+        res = real(docs)
+        if calls["n"] == 2:
+            res["errors"] = 1
+        return res
+
+    monkeypatch.setattr(wb.store, "bulk_index", flaky)
+    seen = []
+    stats = wb.ingest_streaming(recs, chunk_size=4, on_chunk=lambda d, t, s: seen.append(d))
+    assert seen == [4] and stats["stopped_at"] == 4

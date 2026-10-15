@@ -49,6 +49,9 @@ def _setup(args):
         cfg["run"]["n_queries"] = args.n_queries
     embedder = make_embedder(cfg)
     tcfg = get_target(cfg, args.target)
+    if getattr(args, "cmd", None) == "check":
+        tcfg["timeout"] = min(int(tcfg.get("timeout", 60)), 15)  # fail fast instead of hanging on a blocked network
+        tcfg["max_retries"] = 0
     store = make_store(tcfg, embedder.dim)
     wb = Workbench(cfg, store, embedder)
     return cfg, tcfg, wb
@@ -106,8 +109,28 @@ def cmd_init_sample(args) -> int:
     return 0
 
 
+def _whoami(profile, region: str | None = None) -> str:
+    """Which AWS account / role a profile resolves to, so the wrong SAML login is obvious."""
+    try:
+        import boto3
+
+        from botocore.config import Config
+
+        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        quick = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 1})
+        ident = session.client("sts", region_name=region, config=quick).get_caller_identity()
+        return f"account {ident['Account']}, {ident['Arn']}"
+    except Exception as exc:
+        return f"unresolved ({type(exc).__name__}: {str(exc)[:120]})"
+
+
 def cmd_check(args) -> int:
     cfg, tcfg, wb = _setup(args)
+    if cfg["embedder"].get("type") == "titan":
+        log(f"Bedrock identity (profile={cfg['embedder'].get('profile')}): "
+            f"{_whoami(cfg['embedder'].get('profile'), cfg['embedder'].get('region'))}")
+    if tcfg.get("kind") == "opensearch" and tcfg.get("auth", "sigv4") == "sigv4":
+        log(f"Target identity (profile={tcfg.get('profile')}): {_whoami(tcfg.get('profile'), tcfg.get('region'))}")
     t0 = time.perf_counter()
     vec = wb.embedder.embed("connectivity check", use_cache=False)
     log(f"Embedder OK: {wb.embedder.model_id}, dim={len(vec)}, {round((time.perf_counter() - t0) * 1000)} ms")
@@ -150,33 +173,107 @@ def cmd_embed_bench(args) -> int:
     return 0
 
 
+def _checkpoint_path(args, tcfg: dict) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in f"{args.target}-{tcfg.get('index', 'mem')}")
+    return os.path.join(".cache", f"ingest-{safe}.json")
+
+
+def _fmt_secs(x: float) -> str:
+    x = int(x)
+    return f"{x // 3600}h{x % 3600 // 60:02d}m" if x >= 3600 else f"{x // 60}m{x % 60:02d}s"
+
+
+def _ingest_dry_run(args, cfg, tcfg, wb, records) -> int:
+    emb = wb.embedder
+    texts = list(dict.fromkeys(r["text"] for r in records))
+    cached = sum(1 for t in texts if emb.cache.has(emb._key(t)))
+    todo = [t for t in texts if not emb.cache.has(emb._key(t))]
+    chars = sum(len(t) for t in todo)
+    dim = emb.dim
+    log("DRY RUN: nothing was embedded, written or deleted.")
+    log(f"  corpus cases:        {len(records)} ({len(texts)} unique texts)")
+    log(f"  already cached:      {cached}   still to embed: {len(todo)}")
+    log(f"  est. input tokens:   ~{chars // 4} (about 4 characters per token; the real count comes from Bedrock)")
+    if args.rate:
+        log(f"  est. embedding time: ~{_fmt_secs(len(todo) / args.rate)} at {args.rate} embeddings/s")
+    else:
+        log("  est. embedding time: pass --rate <emb/s> from `embed-bench` to get an estimate")
+    log(f"  raw vector size:     ~{round(len(records) * dim * 4 / 1e6, 1)} MB in the index, same again in the local cache")
+    log(f"  memory while ingest: flat (one chunk of {args.chunk} at a time)")
+    mode = "append to" if args.append or args.resume else "DELETE and recreate"
+    log(f"  index:               would {mode} '{tcfg.get('index', 'memory')}' on target '{args.target}'")
+    if getattr(wb.store, "read_only", False):
+        log("  NOTE: this target is read_only, so a real ingest would be refused.")
+    return 0
+
+
 def cmd_ingest(args) -> int:
     cfg, tcfg, wb = _setup(args)
-    _load_corpus(wb, cfg, args.data, args.limit)
-    log(f"Indexing into target '{args.target}' ({wb.store.describe().get('index', 'memory')})...")
-    stats = wb.ingest(recreate=not args.append)
+    if getattr(wb.store, "read_only", False) and not args.dry_run:
+        raise SystemExit(f"Target '{args.target}' is read_only; ingest would modify it. Use a copy of the index.")
+    path = args.data or cfg["data"]["corpus"]
+    records = read_jsonl(path, limit=args.limit)
+    if args.dry_run:
+        return _ingest_dry_run(args, cfg, tcfg, wb, records)
+
+    ckpt = _checkpoint_path(args, tcfg)
+    start = 0
+    if args.resume:
+        try:
+            state = json.load(open(ckpt))
+        except (OSError, ValueError):
+            raise SystemExit(f"No checkpoint at {ckpt}; nothing to resume. Run without --resume.")
+        if state.get("source") != path or state.get("total") != len(records):
+            raise SystemExit(f"Checkpoint {ckpt} is for a different corpus ({state.get('source')}, {state.get('total')} cases).")
+        start = int(state["done"])
+        log(f"Resuming at case {start}/{len(records)}.")
+    recreate = not (args.append or args.resume)
+    log(f"Embedding and indexing {len(records) - start} cases into '{args.target}' "
+        f"({wb.store.describe().get('index', 'memory')}) in chunks of {args.chunk}...")
+
+    t_start = time.perf_counter()
+
+    def on_chunk(done: int, total: int, stats: dict) -> None:
+        os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+        json.dump({"source": path, "total": total, "done": done}, open(ckpt, "w"))
+        elapsed = time.perf_counter() - t_start
+        rate = (done - start) / elapsed if elapsed else 0
+        eta = _fmt_secs((total - done) / rate) if rate else "?"
+        log(f"  {done}/{total} ({round(100 * done / total)}%)  {round(rate, 1)} cases/s  ETA {eta}  "
+            f"429s={wb.embedder.stats['throttles'] + stats['throttled']}")
+
+    stats = wb.ingest_streaming(records, recreate=recreate, start=start, chunk_size=args.chunk, on_chunk=on_chunk)
     log(
         f"Bulk indexed {stats['indexed']} docs in {round(stats['seconds'], 1)}s "
         f"({stats.get('docs_per_sec')} docs/s), errors={stats['errors']}, 429s={stats['throttled']}, retries={stats['retries']}"
     )
+    if stats["stopped_at"] is not None:
+        log(f"STOPPED: indexing errors in the chunk starting at case {stats['stopped_at']}. "
+            "Fix the cause, then continue with `ingest --resume` (same options).")
+        return 1
+    try:
+        os.remove(ckpt)
+    except OSError:
+        pass
     t0 = time.perf_counter()
     deadline = t0 + float(cfg["run"]["visibility_timeout"]) * 3
+    expected = start + stats["indexed"]
     n = 0
     while time.perf_counter() < deadline:
         try:
             n = wb.store.count()
         except Exception:
             n = 0
-        if n >= stats["indexed"]:
+        if n >= expected:
             break
         time.sleep(2)
-    if n >= stats["indexed"]:
+    if n >= expected:
         log(f"All {n} docs countable {round(time.perf_counter() - t0, 1)}s after the last bulk call.")
     else:
-        log(f"WARNING: only {n}/{stats['indexed']} docs countable after waiting; Serverless can lag, re-check later with `check`.")
+        log(f"WARNING: only {n}/{expected} docs countable after waiting; Serverless can lag, re-check later with `check`.")
     if tcfg.get("kind") == "local":
         log("(local target is in-memory: it is rebuilt automatically by each command, so this step is only a dry run)")
-    return 0 if stats["errors"] == 0 else 1
+    return 0
 
 
 def cmd_run(args) -> int:
@@ -298,6 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
     common(s)
     s.add_argument("--data", help="corpus JSONL (default: config data.corpus)")
     s.add_argument("--append", action="store_true", help="do not recreate the index")
+    s.add_argument("--chunk", type=int, default=2000, help="cases embedded and indexed per step (memory stays flat)")
+    s.add_argument("--resume", action="store_true", help="continue an interrupted ingest from its last completed chunk")
+    s.add_argument("--dry-run", action="store_true", help="estimate tokens, time and size; embed, write and delete nothing")
+    s.add_argument("--rate", type=float, help="embeddings/s from embed-bench, used by --dry-run for a time estimate")
     s.set_defaults(fn=cmd_ingest)
 
     s = sub.add_parser("run", help="run the scenarios: recall, existing, new, updated, deleted")

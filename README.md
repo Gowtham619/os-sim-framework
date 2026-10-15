@@ -61,6 +61,8 @@ python -m simtest run    -t serverless --reingest
 python -m simtest compare results/<managed run>.json results/<serverless run>.json
 ```
 
+* `ingest` embeds and indexes in chunks (`--chunk`, default 2000), so memory stays flat however large the corpus. It prints progress, rate and ETA, and writes a checkpoint to `.cache/` after each chunk. If it is interrupted or hits indexing errors, continue with the same command plus `--resume` (embeddings are cached, so nothing is paid for twice). On Serverless with `id_mode: auto`, a chunk that failed halfway can leave duplicates when retried; prefer `id_mode: custom` for big loads.
+* `ingest --dry-run [--rate <emb/s>]` embeds, writes and deletes nothing. It reports cases, how many are already cached, estimated tokens, estimated embedding time, vector size, and whether the index would be deleted and recreated.
 * `run` and `load` change the index (new/updated/deleted cases; writer threads), so pass `--reingest` to start each
   run from the known corpus. Without it, `run` refuses to start if the index doesn't match the corpus file.
 * `run` exits non-zero if any check fails, so it works in CI. Thresholds live under `thresholds:` in the config.

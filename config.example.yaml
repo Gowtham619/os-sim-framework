@@ -27,6 +27,7 @@ targets:
   # OpenSearch Service domain ("OSS cluster")
   managed:
     kind: opensearch
+    profile: managed-account          # each target can use a different AWS account / SAML profile
     endpoint: https://search-YOURDOMAIN-xxxxxxxx.ap-south-1.es.amazonaws.com
     region: ap-south-1
     service: es
@@ -38,6 +39,7 @@ targets:
   # OpenSearch Serverless vector-search collection ("next gen collection")
   serverless:
     kind: opensearch
+    profile: serverless-account       # different account from `managed`: log in to both before running
     endpoint: https://xxxxxxxxxxxx.ap-south-1.aoss.amazonaws.com
     region: ap-south-1
     service: aoss

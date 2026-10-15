@@ -36,6 +36,15 @@ python -m simtest run -c config.local.yaml -t local
 * **Serverless:** `aoss:APIAccessAll` on the collection, a **data access policy** granting the index permissions (`aoss:CreateIndex`, `aoss:DeleteIndex`, `aoss:UpdateIndex`, `aoss:DescribeIndex`, `aoss:ReadDocument`, `aoss:WriteDocument`) and a **network policy** that allows the machine running the test.
 * Run the load generator on EC2 in the same region as the targets, and give it enough CPU and network (see "Scaling up").
 
+## Running against an existing index in a corporate network
+
+1. Log in with your SAML tool and point at the profile it writes (`profile:` on both `embedder` and the target, or `AWS_PROFILE`). Temporary credentials are re-read every `credential_refresh_secs` (OpenSearch) and on `ExpiredToken` (Bedrock); a profile using `credential_process` refreshes most reliably.
+2. Use the `corp` target in `config.example.yaml`: set `ca_certs` for an internal CA, `HTTPS_PROXY`/`NO_PROXY` if you go through a proxy, and the field names of the existing mapping (`vector_field`, `id_field`, ...).
+3. Use the same Titan model, `dimensions` and `normalize` that built the index. Otherwise results are meaningless.
+4. `read_only: true` makes the framework refuse to recreate the index or write/delete documents. `run` then skips `new`, `updated` and `deleted`. Run `check`, then `match`, `run --scenarios existing,recall`, and `load` only with agreement from the cluster owners.
+5. `corpus.jsonl` must be (a subset of) the data in the index. The recall ground truth comes from re-embedding it locally.
+6. For write scenarios, test against a **copy** of the index with `read_only: false`.
+
 ## Workflow
 
 ```bash

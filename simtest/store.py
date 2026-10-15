@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -195,31 +197,81 @@ class LocalStore(VectorStore):
 
 
 # =================================================================================================
-def build_client(cfg: dict):
-    from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection
+class RefreshingSigV4Auth:
+    """SigV4 signer that re-resolves AWS credentials periodically.
 
-    endpoint = cfg["endpoint"]
-    host = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
-    if cfg.get("auth", "sigv4") == "sigv4":
+    SAML/SSO federation hands out temporary credentials (often valid for one hour). A signer built once from
+    `session.get_credentials()` keeps using the values it was given, so long runs start failing with 403s.
+    Re-creating the boto3 session re-reads ~/.aws/credentials and re-runs any `credential_process`.
+    """
+
+    def __init__(self, profile, region: str, service: str, refresh_secs: float = 300.0):
+        self.profile, self.region, self.service = profile, region, service
+        self.refresh_secs = refresh_secs
+        self._lock = threading.Lock()
+        self._built = 0.0
+        self._auth = None
+
+    def _current(self):
+        from opensearchpy import AWSV4SignerAuth
         import boto3
 
-        session = boto3.Session(profile_name=cfg.get("profile")) if cfg.get("profile") else boto3.Session()
-        auth = AWSV4SignerAuth(session.get_credentials(), cfg["region"], cfg.get("service", "es"))
-    else:
+        with self._lock:
+            if self._auth is None or time.monotonic() - self._built > self.refresh_secs:
+                session = boto3.Session(profile_name=self.profile) if self.profile else boto3.Session()
+                creds = session.get_credentials()
+                if creds is None:
+                    raise StoreError("no AWS credentials found; log in through your SAML/SSO tool first")
+                self._auth = AWSV4SignerAuth(creds, self.region, self.service)
+                self._built = time.monotonic()
+            return self._auth
+
+    def __call__(self, request):
+        return self._current()(request)
+
+
+def build_client(cfg: dict):
+    from opensearchpy import OpenSearch, RequestsHttpConnection
+
+    endpoint = cfg["endpoint"]
+    parsed = urlparse(endpoint if "://" in endpoint else f"https://{endpoint}")
+    use_ssl = bool(cfg["use_ssl"]) if cfg.get("use_ssl") is not None else parsed.scheme != "http"
+    port = int(cfg.get("port") or parsed.port or (443 if use_ssl else 80))
+    url_prefix = cfg.get("url_prefix") or parsed.path.strip("/")
+    auth_kind = cfg.get("auth", "sigv4")
+    if auth_kind == "sigv4":
+        auth = RefreshingSigV4Auth(
+            cfg.get("profile"), cfg["region"], cfg.get("service", "es"), float(cfg.get("credential_refresh_secs", 300))
+        )
+    elif auth_kind == "basic":
         user, pwd = os.environ.get("OS_USER"), os.environ.get("OS_PASS")
         if not user or not pwd:
             raise StoreError("auth=basic requires OS_USER and OS_PASS environment variables")
         auth = (user, pwd)
+    else:
+        raise StoreError(f"unknown auth '{auth_kind}' (use sigv4 or basic)")
+    kwargs: dict = {}
+    if cfg.get("ca_certs"):
+        kwargs["ca_certs"] = cfg["ca_certs"]  # internal / corporate CA bundle (PEM)
+    if cfg.get("client_cert"):
+        kwargs["client_cert"] = cfg["client_cert"]
+    if cfg.get("client_key"):
+        kwargs["client_key"] = cfg["client_key"]
+    if cfg.get("headers"):
+        kwargs["headers"] = dict(cfg["headers"])
+    if url_prefix:
+        kwargs["url_prefix"] = url_prefix
     return OpenSearch(
-        hosts=[{"host": host, "port": 443}],
+        hosts=[{"host": parsed.hostname, "port": port}],
         http_auth=auth,
-        use_ssl=True,
-        verify_certs=True,
+        use_ssl=use_ssl,
+        verify_certs=bool(cfg.get("verify_certs", True)),
         connection_class=RequestsHttpConnection,
         pool_maxsize=int(cfg.get("pool_maxsize", 64)),
         timeout=int(cfg.get("timeout", 60)),
         max_retries=3,
         retry_on_timeout=True,
+        **kwargs,
     )
 
 
@@ -237,7 +289,19 @@ class OpenSearchStore(VectorStore):
         self.space_type = cfg.get("space_type", "innerproduct")
         self.engine = cfg.get("engine", "faiss")
         self.backoff_base = float(cfg.get("backoff_base", 0.5))
+        self.f_vec = cfg.get("vector_field", "embedding")
+        self.f_id = cfg.get("id_field", "doc_id")
+        self.f_text = cfg.get("text_field", "text")
+        self.f_ver = cfg.get("version_field", "version")
+        self.read_only = bool(cfg.get("read_only", False))
         self.client = client if client is not None else build_client(cfg)
+
+    def _writable(self, op: str) -> None:
+        if self.read_only:
+            raise StoreError(
+                f"target '{self.name}' is read_only: refusing to {op}. Set read_only: false on the target "
+                "only for an index you are happy to modify (use a copy of the corporate index)."
+            )
 
     # -- helpers ---------------------------------------------------------------------------------
     def describe(self) -> dict:
@@ -251,6 +315,7 @@ class OpenSearchStore(VectorStore):
             "id_mode": self.id_mode,
             "engine": self.engine,
             "space_type": self.space_type,
+            "read_only": self.read_only,
         }
 
     @staticmethod
@@ -265,7 +330,7 @@ class OpenSearchStore(VectorStore):
             time.sleep(min(10.0, self.backoff_base * (2**attempt)) * (0.5 + random.random() / 2))
 
     def _doc_body(self, doc: Doc) -> dict:
-        body = {"doc_id": doc.id, "text": doc.text, "version": doc.version, "embedding": [float(x) for x in doc.vector]}
+        body = {self.f_id: doc.id, self.f_text: doc.text, self.f_ver: doc.version, self.f_vec: [float(x) for x in doc.vector]}
         body.update(doc.meta or {})
         return body
 
@@ -299,16 +364,22 @@ class OpenSearchStore(VectorStore):
             "settings": settings,
             "mappings": {
                 "properties": {
-                    "doc_id": {"type": "keyword"},
-                    "text": {"type": "text"},
-                    "version": {"type": "integer"},
-                    "embedding": emb,
+                    self.f_id: {"type": "keyword"},
+                    self.f_text: {"type": "text"},
+                    self.f_ver: {"type": "integer"},
+                    self.f_vec: emb,
                 }
             },
         }
 
     def create_index(self, recreate: bool = False) -> None:
         exists = self.client.indices.exists(index=self.index)
+        if self.read_only:
+            if not exists:
+                raise StoreError(f"index '{self.index}' does not exist and target '{self.name}' is read_only")
+            if recreate:
+                self._writable("recreate the index")
+            return
         if exists and recreate:
             self.client.indices.delete(index=self.index)
             exists = False
@@ -333,6 +404,7 @@ class OpenSearchStore(VectorStore):
 
     # -- writes ----------------------------------------------------------------------------------
     def _bulk_chunk(self, chunk: Sequence[Doc]) -> dict:
+        self._writable("bulk index")
         stats = {"indexed": 0, "errors": 0, "throttled": 0, "retries": 0}
         pending = list(chunk)
         for attempt in range(7):
@@ -392,7 +464,7 @@ class OpenSearchStore(VectorStore):
 
     def _lookup_ids(self, doc_id: str) -> list[str]:
         resp = self.client.search(
-            index=self.index, body={"size": 10, "_source": False, "query": {"term": {"doc_id": doc_id}}}
+            index=self.index, body={"size": 10, "_source": False, "query": {"term": {self.f_id: doc_id}}}
         )
         return [h["_id"] for h in resp["hits"]["hits"]]
 
@@ -404,6 +476,7 @@ class OpenSearchStore(VectorStore):
                 raise
 
     def upsert(self, doc: Doc) -> None:
+        self._writable("write documents")
         if self.id_mode == "custom":
             self.client.index(index=self.index, id=doc.id, body=self._doc_body(doc))
             return
@@ -412,6 +485,7 @@ class OpenSearchStore(VectorStore):
         self.client.index(index=self.index, body=self._doc_body(doc))
 
     def delete(self, doc_id: str) -> None:
+        self._writable("delete documents")
         if self.id_mode == "custom":
             self._delete_by_engine_id(doc_id)
             return
@@ -423,7 +497,7 @@ class OpenSearchStore(VectorStore):
         knn: dict = {"vector": [float(x) for x in vector], "k": k}
         if self.cfg.get("query_ef_search"):
             knn["method_parameters"] = {"ef_search": int(self.cfg["query_ef_search"])}
-        return {"size": k, "_source": ["doc_id", "version"], "query": {"knn": {"embedding": knn}}}
+        return {"size": k, "_source": [self.f_id, self.f_ver], "query": {"knn": {self.f_vec: knn}}}
 
     def _parse_hits(self, resp: dict) -> list[Hit]:
         hits = []
@@ -432,10 +506,10 @@ class OpenSearchStore(VectorStore):
             score = float(h["_score"])
             hits.append(
                 Hit(
-                    id=src.get("doc_id", h["_id"]),
+                    id=src.get(self.f_id, h["_id"]),
                     score=score,
                     similarity=score_to_similarity(self.space_type, score, self.engine),
-                    version=src.get("version"),
+                    version=src.get(self.f_ver),
                 )
             )
         return hits

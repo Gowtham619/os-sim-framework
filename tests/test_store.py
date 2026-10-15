@@ -173,3 +173,51 @@ def test_wait_visible_measures_lag_and_times_out():
     assert s.wait_gone("ghost", unit(77), timeout=1, poll=0.001) is not None
     s.delete("d1")
     assert s.wait_gone("d1", d.vector, timeout=1, poll=0.001) is not None
+
+
+# -- corporate-network options ---------------------------------------------------------------------
+def test_read_only_target_refuses_writes():
+    import pytest
+
+    from simtest.store import OpenSearchStore, StoreError
+
+    fake = FakeOS()
+    fake.index_exists = True
+    store = OpenSearchStore({"index": "i", "read_only": True, "name": "corp"}, dim=4, client=fake)
+    store.create_index()  # existing index is fine
+    with pytest.raises(StoreError):
+        store.create_index(recreate=True)
+    with pytest.raises(StoreError):
+        store.upsert(Doc("a", "t", np.ones(4, dtype=np.float32)))
+    with pytest.raises(StoreError):
+        store.delete("a")
+    with pytest.raises(StoreError):
+        store.bulk_index([Doc("a", "t", np.ones(4, dtype=np.float32))])
+    assert fake.docs == {} and fake.index_exists
+
+
+def test_custom_field_names_used_in_queries():
+    from simtest.store import OpenSearchStore
+
+    store = OpenSearchStore(
+        {"index": "i", "vector_field": "vec", "id_field": "case_id", "version_field": "ver", "text_field": "body"},
+        dim=4,
+        client=FakeOS(),
+    )
+    body = store._search_body(np.ones(4, dtype=np.float32), 3)
+    assert "vec" in body["query"]["knn"] and body["_source"] == ["case_id", "ver"]
+    assert set(store._doc_body(Doc("a", "t", np.ones(4, dtype=np.float32)))) >= {"case_id", "body", "ver", "vec"}
+
+
+def test_build_client_connection_options(monkeypatch):
+    import opensearchpy
+
+    from simtest import store as st
+
+    seen = {}
+    monkeypatch.setattr(opensearchpy, "OpenSearch", lambda **kw: seen.update(kw) or object())
+    st.build_client(
+        {"endpoint": "https://os.corp.example:9243/gw", "region": "us-east-1", "ca_certs": "/etc/corp-ca.pem", "auth": "sigv4"}
+    )
+    assert seen["hosts"] == [{"host": "os.corp.example", "port": 9243}]
+    assert seen["ca_certs"] == "/etc/corp-ca.pem" and seen["url_prefix"] == "gw" and seen["use_ssl"] is True

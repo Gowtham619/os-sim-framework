@@ -63,6 +63,20 @@ def _load_corpus(wb: Workbench, cfg: dict, path: str | None = None, limit: int |
 
 def _ensure_populated(wb: Workbench, tcfg: dict, reingest: bool) -> None:
     expected = wb.mirror.count()
+    if getattr(wb.store, "read_only", False):
+        if reingest:
+            raise SystemExit("--reingest would recreate the index, but this target is read_only.")
+        try:
+            n = wb.store.count()
+        except Exception as exc:
+            raise SystemExit(f"Cannot read the index ({type(exc).__name__}: {str(exc)[:200]}).")
+        if n != expected:
+            log(
+                f"WARNING: read_only index holds {n} docs but the corpus file has {expected}. Recall and self-retrieval "
+                "numbers are only meaningful if the corpus file is the data that is in the index (use --limit/a sample "
+                "file that is a subset of it)."
+            )
+        return
     if reingest:
         log("Re-creating index and ingesting corpus...")
         stats = wb.ingest(recreate=True)
@@ -170,6 +184,11 @@ def cmd_run(args) -> int:
     _load_corpus(wb, cfg, limit=args.limit)
     _ensure_populated(wb, tcfg, args.reingest)
     names = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+    if getattr(wb.store, "read_only", False):
+        blocked = [n for n in names if n in ("new", "updated", "deleted")]
+        if blocked:
+            log(f"Target is read_only: skipping scenarios that write to the index: {', '.join(blocked)}")
+            names = [n for n in names if n not in blocked]
     new_recs = read_jsonl(cfg["data"]["new_cases"]) if "new" in names else []
     upd_recs = read_jsonl(cfg["data"]["updates"]) if "updated" in names else []
     if args.max_new:

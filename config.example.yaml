@@ -4,6 +4,7 @@
 embedder:
   type: titan                         # titan | hash (hash = offline stand-in)
   model_id: amazon.titan-embed-text-v2:0
+  # For SAML/SSO, set `profile:` below; credentials are re-read automatically if Bedrock reports them expired.
   region: us-east-1                   # region where you have Bedrock model access (can differ from OpenSearch)
   profile: null                       # optional AWS profile name
   dimensions: 1024                    # Titan v2: 256 | 512 | 1024  (must match the index mapping; the framework sets both)
@@ -44,6 +45,27 @@ targets:
     id_mode: auto                     # try `custom` first if your collection accepts custom ids; `auto` is the safe default
     # ef_search: null                 # uncomment if the collection rejects the index-level ef_search setting
     # post_create_wait: 15            # seconds to wait after creating the index
+
+  # Existing vector index inside a corporate network (SAML-federated AWS credentials). READ-ONLY by default.
+  # Log in first with your SAML tool (saml2aws / aws-adfs / aws sso login), then: export AWS_PROFILE=<profile>
+  corp:
+    kind: opensearch
+    endpoint: https://opensearch.corp.example.com:443   # port / path are taken from the URL (or set port:, url_prefix:)
+    region: us-east-1
+    service: es
+    auth: sigv4                       # credentials come from the profile below; they expire, so they are re-read every 5 min
+    profile: corp-saml                # AWS profile written by your SAML tool (ideally one using credential_process)
+    ca_certs: /etc/ssl/corp-ca.pem    # corporate CA bundle, if the cluster uses an internal CA
+    # verify_certs: false             # last resort for testing only
+    index: existing-cases-index       # the EXISTING index; never point write tests at a production index
+    read_only: true                   # refuse to create/recreate the index or write/delete documents
+    id_mode: custom
+    vector_field: embedding           # field names in the existing mapping
+    id_field: doc_id                  # must be a keyword field holding the case id
+    text_field: text
+    version_field: version            # only needed for the `updated` scenario
+    # m / ef_construction / space_type are NOT applied to an existing index; match space_type to the mapping
+    # (GET <index>/_mapping) so score-to-similarity is correct.
 
   # Optional: exact in-memory target, handy to sanity-check the framework itself
   local:

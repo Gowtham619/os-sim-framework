@@ -24,6 +24,20 @@ DEFAULTS: dict[str, Any] = {
         "service": "es",  # es = managed domain, aoss = OpenSearch Serverless
         "auth": "sigv4",  # sigv4 | basic (basic reads OS_USER / OS_PASS from the environment)
         "profile": None,
+        "port": None,  # default: from the endpoint URL, else 443 (https) / 80 (http)
+        "use_ssl": None,  # default: true unless the endpoint starts with http://
+        "verify_certs": True,
+        "ca_certs": None,  # path to a PEM bundle for an internal / corporate CA
+        "client_cert": None,  # mTLS, if the cluster requires it
+        "client_key": None,
+        "url_prefix": None,  # when the cluster sits behind a gateway path, e.g. /opensearch
+        "headers": {},  # extra HTTP headers
+        "credential_refresh_secs": 300,  # sigv4: re-resolve AWS credentials this often (SAML/SSO creds expire)
+        "read_only": False,  # true = refuse to create/recreate the index or write/delete any document
+        "vector_field": "embedding",
+        "id_field": "doc_id",
+        "text_field": "text",
+        "version_field": "version",
         "index": "sim-cases",
         "shards": 3,  # ignored on Serverless
         "replicas": 1,  # ignored on Serverless

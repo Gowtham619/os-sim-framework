@@ -167,6 +167,8 @@ class TitanEmbedder(BaseEmbedder):
         "ServiceUnavailableException",
         "InternalServerException",
     }
+    # SAML/SSO credentials are temporary; on these codes rebuild the client so fresh credentials are picked up
+    EXPIRED = {"ExpiredTokenException", "ExpiredToken", "UnrecognizedClientException", "RequestExpired"}
 
     def __init__(
         self,
@@ -193,22 +195,31 @@ class TitanEmbedder(BaseEmbedder):
         self.max_retries = max_retries
         self._sleep = sleep
         self.cache_tag = f"titan|{model_id}|{self.dim}|{normalize}"
-        if client is None:
-            import boto3
-            from botocore.config import Config
+        self._profile, self._region, self._workers = profile, region, workers
+        self._client_lock = threading.Lock()
+        self._can_rebuild = client is None
+        self.client = client if client is not None else self._build_client()
 
-            session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-            client = session.client(
-                "bedrock-runtime",
-                region_name=region,
-                config=Config(
-                    max_pool_connections=max(10, workers * 2),
-                    read_timeout=60,
-                    connect_timeout=10,
-                    retries={"max_attempts": 1, "mode": "standard"},
-                ),
-            )
-        self.client = client
+    def _build_client(self):
+        import boto3
+        from botocore.config import Config
+
+        session = boto3.Session(profile_name=self._profile) if self._profile else boto3.Session()
+        return session.client(
+            "bedrock-runtime",
+            region_name=self._region,
+            config=Config(
+                max_pool_connections=max(10, self._workers * 2),
+                read_timeout=60,
+                connect_timeout=10,
+                retries={"max_attempts": 1, "mode": "standard"},
+            ),
+        )
+
+    def _rebuild_client(self, stale) -> None:
+        with self._client_lock:
+            if self.client is stale:  # another thread may already have refreshed it
+                self.client = self._build_client()
 
     def _request_body(self, text: str) -> dict:
         body: dict = {"inputText": text}
@@ -230,7 +241,8 @@ class TitanEmbedder(BaseEmbedder):
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                resp = self.client.invoke_model(
+                client = self.client
+                resp = client.invoke_model(
                     modelId=self.model_id, body=body, contentType="application/json", accept="application/json"
                 )
                 payload = json.loads(resp["body"].read())
@@ -244,6 +256,10 @@ class TitanEmbedder(BaseEmbedder):
                 return vec
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
+                if code in self.EXPIRED and self._can_rebuild and attempt < 2:
+                    self._rebuild_client(client)  # re-reads the profile / re-runs credential_process
+                    last_err = exc
+                    continue
                 if code not in self.RETRYABLE:
                     raise
                 last_err = exc

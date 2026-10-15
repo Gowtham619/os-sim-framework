@@ -69,6 +69,39 @@ python -m simtest compare results/<managed run>.json results/<serverless run>.js
 * Every command writes JSON to `results/`; nothing is overwritten.
 * `--scenarios existing,new` runs a subset; `--limit 5000` uses only the first 5,000 corpus cases; `--k` and `--n-queries` override the config.
 
+## Comparing modes and configs: reports and sweeps
+
+Every `run`, `load` and `match` result now records a **label** (`--label m32-ef200`), a masked snapshot of the effective
+config (target and embedder settings, thresholds; secrets such as headers and key paths are replaced by `***`), and the
+ingest and embedding cost. That is what lets runs be compared later.
+
+```bash
+# any number of result files or folders; run/load/match results with the same label become one column
+python -m simtest report results/ --out results/comparison            # writes comparison.md and comparison.html
+python -m simtest report a.json b.json c.json --labels managed,serverless,corp --format html --redact
+```
+
+The report has: the runs, scenario PASS/FAIL per run with the failed checks spelled out, quality and speed tables,
+load results with throughput and p99 charts, cost and effort (embedding calls and throttles, ingest time and rate),
+and a table of **only the settings that differ** between the runs. The best value in each row is shown in bold, but only
+where higher or lower is clearly better and the difference is more than 2%, so noise isn't crowned a winner.
+`--redact` hides endpoints and profiles so the file can be shared. The HTML is a single self-contained file (light and
+dark mode, hover tooltips on chart points, and every chart's numbers are also in a table).
+
+```bash
+# try a grid of settings, then get the report automatically
+python -m simtest sweep -t managed --vary m=16,32 --vary ef_search=50,200 --scenarios recall,existing --limit 20000 --yes
+python -m simtest sweep -t managed --vary query_ef_search=50,100,200 --stages 8,16,32 --duration 30 --yes
+python -m simtest sweep -t managed --vary embedder.dimensions=256,512,1024 --dry-run          # just print the plan
+```
+
+`--vary key=v1,v2` can be repeated (all combinations are run). Keys are target settings (`m`, `ef_construction`,
+`ef_search`, `space_type`, `shards`, ...), `embedder.<setting>` (for example `embedder.dimensions`) or `run.<setting>`.
+Settings that only change how queries are made (`query_ef_search`, `run.*`) reuse the index; anything that changes the
+index or the vectors rebuilds it, and so does any scenario that modifies the index (`new`, `updated`, `deleted`).
+**A sweep deletes and recreates the target's index**, so it needs `--yes` on a real target and refuses a `read_only`
+one. Use a test index and a sampled corpus (`--limit`); results go to `results/sweep_<time>/` with `sweep_report.md/.html`.
+
 ## Your own data (JSONL, one object per line)
 
 ```jsonc

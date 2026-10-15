@@ -75,3 +75,30 @@ def test_cli_run_exits_nonzero_when_a_check_fails(tmp_path):
     sh(["init-sample", "--out", str(data), "--corpus", "100", "--new", "5", "--updates", "5", "--dataset-a", "5"])
     out = sh(["run", "-c", str(cfg_path), "-t", "local", "--out", str(tmp_path / "r"), "--scenarios", "existing"], expect=1)
     assert "[FAIL] existing" in out and "OVERALL: FAIL" in out
+
+
+def test_sweep_and_report_end_to_end(tmp_path):
+    data = tmp_path / "data"
+    cfg = {
+        "embedder": {"type": "hash", "dimensions": 64, "cache_path": str(tmp_path / "cache.sqlite")},
+        "targets": {"local": {"kind": "local"}},
+        "data": {"corpus": str(data / "corpus.jsonl"), "new_cases": str(data / "new_cases.jsonl"), "updates": str(data / "updates.jsonl")},
+        "run": {"n_queries": 20},
+    }
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg))
+    sh(["init-sample", "--out", str(data), "--corpus", "100", "--new", "5", "--updates", "5", "--dataset-a", "5"])
+    out = tmp_path / "sw"
+    text = sh(["sweep", "-c", str(cfg_path), "-t", "local", "--vary", "embedder.dimensions=64,128", "--limit", "100",
+               "--stages", "2", "--duration", "0.2", "--warmup", "0", "--pause", "0", "--queries", "10", "--out", str(out)])
+    assert "Sweep done: 4 result files" in text
+    md = (out / "sweep_report.md").read_text()
+    assert "embedder.dimensions=64" in md and "embedder.dimensions=128" in md and "## Load test" in md
+    assert (out / "sweep_report.html").exists() and (out / "sweep.json").exists()
+
+    # the standalone report command accepts the same folder and honours --format
+    sh(["report", str(out), "--format", "md", "--out", str(tmp_path / "again")])
+    assert (tmp_path / "again.md").exists() and not (tmp_path / "again.html").exists()
+
+    plan_only = sh(["sweep", "-c", str(cfg_path), "-t", "local", "--vary", "m=16,32", "--dry-run"])
+    assert "2 points" in plan_only

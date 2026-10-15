@@ -47,6 +47,7 @@ class Workbench:
         self.rng = random.Random(int(run["seed"]))
         self.mirror = LocalStore("mirror")
         self.records: dict[str, dict] = {}
+        self.last_ingest: Optional[dict] = None  # stats of the most recent ingest through this workbench
 
     # -- corpus ----------------------------------------------------------------------------------
     def load_corpus(self, records: list[dict], progress: bool = False) -> None:
@@ -68,6 +69,7 @@ class Workbench:
         stats = self.store.bulk_index(self.docs(), progress=progress)
         self.store.refresh()
         stats["docs_per_sec"] = round(stats["indexed"] / stats["seconds"], 1) if stats.get("seconds") else None
+        self.last_ingest = stats
         return stats
 
     def ingest_streaming(

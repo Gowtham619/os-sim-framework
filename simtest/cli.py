@@ -14,9 +14,12 @@ from .data import generate_sample, read_jsonl, synthetic_texts
 from .embedder import make_embedder
 from .loadtest import make_query_vectors, run_load
 from .match import run_match
+from .meta import build_meta, save_result
+from .multireport import write_report
 from .metrics import summarize_latency
 from .report import compare, print_load, print_run, table
-from .scenarios import CANONICAL, Workbench, run_scenarios
+from .scenarios import CANONICAL, MUTATING, Workbench, run_scenarios
+from .sweep import parse_vary, plan as sweep_plan, run_sweep
 from .store import make_store
 
 
@@ -28,17 +31,7 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def _save(out_dir: str, target: str, kind: str, doc: dict) -> str:
-    os.makedirs(out_dir, exist_ok=True)
-    ts = _ts()
-    path = os.path.join(out_dir, f"{ts}_{target}_{kind}.json")
-    n = 1
-    while os.path.exists(path):  # never overwrite an earlier result from the same second
-        n += 1
-        path = os.path.join(out_dir, f"{ts}-{n}_{target}_{kind}.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2, default=str)
-    return path
+_save = save_result
 
 
 def _setup(args):
@@ -292,17 +285,7 @@ def cmd_run(args) -> int:
         new_recs = new_recs[: args.max_new]
     start_size = len(wb.records)
     results = run_scenarios(wb, names, new_recs, upd_recs, log=log)
-    meta = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "target": args.target,
-        "target_info": wb.store.describe(),
-        "index": wb.store.describe().get("index"),
-        "embedder": wb.embedder.model_id,
-        "dim": wb.embedder.dim,
-        "corpus_size": start_size,
-        "k": wb.k,
-        "embedder_stats": wb.embedder.summary(),
-    }
+    meta = build_meta(cfg, tcfg, wb, args.target, getattr(args, "label", None), corpus_size=start_size)
     print_run(results, meta)
     path = _save(args.out, args.target, "run", {"meta": meta, "scenarios": results, "passed": all(r["passed"] for r in results)})
     log(f"\nSaved {path}")
@@ -322,8 +305,7 @@ def cmd_load(args) -> int:
         writer_docs=writer_docs, writers=args.writers, pause=args.pause, log=log,
     )
     print_load(res)
-    meta = {"timestamp": datetime.now().isoformat(timespec="seconds"), "target": args.target, "target_info": wb.store.describe(),
-            "dim": wb.embedder.dim, "corpus_size": len(wb.records), "k": wb.k, "writers": args.writers}
+    meta = build_meta(cfg, tcfg, wb, args.target, getattr(args, "label", None), writers=args.writers)
     path = _save(args.out, args.target, "load", {"meta": meta, "load": res})
     log(f"\nSaved {path}")
     if args.writers:
@@ -341,7 +323,7 @@ def cmd_match(args) -> int:
     log(f"Matching {len(recs)} records from {path} against the indexed corpus (top {wb.k})...")
     metrics = run_match(wb, recs, wb.k, args.min_sim, out_csv, batch=args.batch, workers=args.workers, log=log)
     print(json.dumps(metrics, indent=2))
-    meta = {"timestamp": datetime.now().isoformat(timespec="seconds"), "target": args.target, "target_info": wb.store.describe()}
+    meta = build_meta(cfg, tcfg, wb, args.target, getattr(args, "label", None))
     p = _save(args.out, args.target, "match", {"meta": meta, "match": metrics})
     log(f"\nSaved {p}")
     return 0
@@ -358,6 +340,67 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def cmd_sweep(args) -> int:
+    cfg = load_config(args.config)
+    if args.k:
+        cfg["run"]["k"] = args.k
+    if args.n_queries:
+        cfg["run"]["n_queries"] = args.n_queries
+    try:
+        vary = parse_vary(args.vary)
+        names = [x.strip() for x in args.scenarios.split(",") if x.strip()]
+        points = sweep_plan(vary, names, args.label or "")
+        tcfg = get_target(cfg, args.target)
+    except (ValueError, KeyError) as exc:
+        raise SystemExit(str(exc))
+    index = tcfg.get("index", "memory")
+    rebuilds = sum(1 for p in points if p["reingest"])
+    log(f"Sweep on '{args.target}': {len(points)} points, scenarios: {', '.join(names)}"
+        + (f", then a load test ({args.stages} clients)" if args.stages else ""))
+    for n, p in enumerate(points, 1):
+        log(f"  {n:>2}. {p['label']}   [{'rebuild index' if p['reingest'] else 'reuse index'}]")
+    if tcfg.get("read_only"):
+        raise SystemExit(f"Target '{args.target}' is read_only; a sweep rebuilds indexes. Use a copy of the index.")
+    if tcfg.get("kind") != "local":
+        log(f"\nThis DELETES AND RECREATES index '{index}' on '{args.target}' {rebuilds} time(s). "
+            "Use a test index, not one that holds data you need.")
+        if not args.dry_run and not args.yes:
+            raise SystemExit("Re-run with --yes to confirm (or --dry-run to only see the plan).")
+    if args.dry_run:
+        return 0
+    load = (
+        {"stages": [int(x) for x in args.stages.split(",")], "duration": args.duration, "warmup": args.warmup,
+         "queries": args.queries, "pause": args.pause}
+        if args.stages else None
+    )
+    out = args.out or os.path.join("results", f"sweep_{_ts()}")
+    try:
+        res = run_sweep(cfg, args.target, vary, names, out, limit=args.limit, label_prefix=args.label or "",
+                        load=load, redact=args.redact, log=log)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    log(f"\nSweep done: {len(res['files'])} result files in {out}")
+    for w in res["reports"]:
+        log(f"Wrote {w}")
+    return 0
+
+
+def cmd_report(args) -> int:
+    prefix = args.out or os.path.join("results", f"report_{_ts()}")
+    if prefix.endswith((".md", ".html")):
+        prefix = prefix.rsplit(".", 1)[0]
+    labels = [x.strip() for x in args.labels.split(",")] if args.labels else None
+    try:
+        written, skipped = write_report(args.files, prefix, args.format, labels, args.redact, args.title)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    for sk in skipped:
+        log(f"skipped {sk}")
+    for w in written:
+        log(f"Wrote {w}")
+    return 0
+
+
 # -------------------------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="simtest", description="Similarity-search test framework (Bedrock Titan + OpenSearch)")
@@ -366,6 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def common(sp, target=True):
         sp.add_argument("--config", "-c", default="config.yaml", help="config file (default: config.yaml)")
+        sp.add_argument("--label", help="name for this run in saved results and reports (e.g. m32-ef200)")
         if target:
             sp.add_argument("--target", "-t", required=True, help="target name from the config (e.g. managed, serverless, local)")
         sp.add_argument("--k", type=int, help="top-k (overrides config run.k)")
@@ -430,6 +474,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--csv", help="output CSV path")
     s.add_argument("--reingest", action="store_true")
     s.set_defaults(fn=cmd_match)
+
+    s = sub.add_parser("sweep", help="run the scenarios over a grid of settings and build a comparison report")
+    common(s)
+    s.set_defaults(out=None)
+    s.add_argument("--vary", action="append", required=True, metavar="KEY=V1,V2",
+                   help="setting to vary, repeatable (e.g. m=16,32  ef_search=50,200  query_ef_search=50,200  embedder.dimensions=256,1024)")
+    s.add_argument("--scenarios", default="recall,existing", help=f"comma list from: {', '.join(CANONICAL)} (new/updated/deleted rebuild the index at every point)")
+    s.add_argument("--n-queries", type=int, help="queries per scenario (overrides config run.n_queries)")
+    s.add_argument("--stages", help="also run a load test at each point with these client counts, e.g. 8,16,32")
+    s.add_argument("--duration", type=float, default=30, help="load: seconds per stage")
+    s.add_argument("--warmup", type=float, default=5, help="load: warm-up seconds per stage")
+    s.add_argument("--queries", type=int, default=500, help="load: distinct query vectors")
+    s.add_argument("--pause", type=float, default=3.0, help="load: seconds between stages")
+    s.add_argument("--dry-run", action="store_true", help="print the plan only")
+    s.add_argument("--yes", action="store_true", help="confirm that the index on a non-local target may be deleted and recreated")
+    s.add_argument("--redact", action="store_true", help="hide endpoints and profiles in the report")
+    s.set_defaults(fn=cmd_sweep)
+
+    s = sub.add_parser("report", help="build a Markdown/HTML comparison report from any number of result files or folders")
+    s.add_argument("files", nargs="+", help="result JSON files or folders of them (run, load and match results can be mixed)")
+    s.add_argument("--format", choices=["md", "html", "both"], default="both")
+    s.add_argument("--out", help="output path without extension (default: results/report_<time>)")
+    s.add_argument("--labels", help="comma list naming the files in order, overriding the saved labels")
+    s.add_argument("--title", default="Similarity search comparison")
+    s.add_argument("--redact", action="store_true", help="hide endpoints, profiles and other environment identifiers")
+    s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser("compare", help="compare two result JSON files side by side (e.g. managed vs serverless)")
     s.add_argument("a")

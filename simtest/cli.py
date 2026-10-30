@@ -102,28 +102,58 @@ def cmd_init_sample(args) -> int:
     return 0
 
 
-def _whoami(profile, region: str | None = None) -> str:
+def _whoami(profile, region: str | None = None, sts_endpoint: str | None = None) -> str:
     """Which AWS account / role a profile resolves to, so the wrong SAML login is obvious."""
     try:
         import boto3
-
         from botocore.config import Config
 
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
         quick = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 1})
-        ident = session.client("sts", region_name=region, config=quick).get_caller_identity()
+        ident = session.client("sts", region_name=region, endpoint_url=sts_endpoint, config=quick).get_caller_identity()
         return f"account {ident['Account']}, {ident['Arn']}"
     except Exception as exc:
         return f"unresolved ({type(exc).__name__}: {str(exc)[:120]})"
 
 
+def _net_probe(label: str, url: str | None, default_port: int = 443) -> None:
+    """DNS + TCP reachability, which is what fails first for a service inside a private VPC."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    if not url:
+        return
+    u = urlparse(url if "://" in url else f"https://{url}")
+    host, port = u.hostname, u.port or (80 if u.scheme == "http" else default_port)
+    try:
+        ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+    except OSError as exc:
+        log(f"Network {label}: {host} does not resolve ({exc}). From outside the VPC (or without private DNS) "
+            "a VPC-only endpoint will not resolve; run from inside the VPC / over VPN, or fix DNS.")
+        return
+    kinds = ["private" if ipaddress.ip_address(i).is_private else "PUBLIC" for i in ips]
+    where = f"{', '.join(ips[:3])} ({'/'.join(sorted(set(kinds)))})"
+    try:
+        socket.create_connection((host, port), timeout=5).close()
+        log(f"Network {label}: {host}:{port} resolves to {where}, TCP connect OK")
+    except OSError as exc:
+        log(f"Network {label}: {host}:{port} resolves to {where} but TCP connect failed ({type(exc).__name__}). "
+            "Check route/VPN, security group inbound 443 from this machine, NACLs and the proxy settings.")
+
+
 def cmd_check(args) -> int:
     cfg, tcfg, wb = _setup(args)
-    if cfg["embedder"].get("type") == "titan":
-        log(f"Bedrock identity (profile={cfg['embedder'].get('profile')}): "
-            f"{_whoami(cfg['embedder'].get('profile'), cfg['embedder'].get('region'))}")
-    if tcfg.get("kind") == "opensearch" and tcfg.get("auth", "sigv4") == "sigv4":
-        log(f"Target identity (profile={tcfg.get('profile')}): {_whoami(tcfg.get('profile'), tcfg.get('region'))}")
+    emb = cfg["embedder"]
+    if emb.get("type") == "titan":
+        _net_probe("Bedrock", emb.get("endpoint_url") or f"https://bedrock-runtime.{emb['region']}.amazonaws.com")
+        log(f"Bedrock identity (profile={emb.get('profile')}): "
+            f"{_whoami(emb.get('profile'), emb.get('region'), emb.get('sts_endpoint_url'))}")
+    if tcfg.get("kind") == "opensearch":
+        _net_probe(f"target '{args.target}'", tcfg.get("endpoint"), int(tcfg.get("port") or 443))
+        if tcfg.get("auth", "sigv4") == "sigv4":
+            log(f"Target identity (profile={tcfg.get('profile')}): "
+                f"{_whoami(tcfg.get('profile'), tcfg.get('region'), tcfg.get('sts_endpoint_url'))}")
     t0 = time.perf_counter()
     vec = wb.embedder.embed("connectivity check", use_cache=False)
     log(f"Embedder OK: {wb.embedder.model_id}, dim={len(vec)}, {round((time.perf_counter() - t0) * 1000)} ms")

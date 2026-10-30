@@ -13,6 +13,8 @@ DEFAULTS: dict[str, Any] = {
         "model_id": "amazon.titan-embed-text-v2:0",
         "region": "us-east-1",
         "profile": None,
+        "endpoint_url": None,  # override, e.g. a bedrock-runtime VPC endpoint: https://vpce-xxxx.bedrock-runtime.<region>.vpce.amazonaws.com
+        "sts_endpoint_url": None,  # used only by `check` to show which account you are in (VPC endpoint for STS)
         "dimensions": 1024,  # Titan v2: 256 | 512 | 1024. Titan v1 is fixed at 1536.
         "normalize": True,
         "workers": 8,
@@ -24,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
         "service": "es",  # es = managed domain, aoss = OpenSearch Serverless
         "auth": "sigv4",  # sigv4 | basic (basic reads OS_USER / OS_PASS from the environment)
         "profile": None,
+        "sts_endpoint_url": None,  # used only by `check` to show which account you are in
         "port": None,  # default: from the endpoint URL, else 443 (https) / 80 (http)
         "use_ssl": None,  # default: true unless the endpoint starts with http://
         "verify_certs": True,

@@ -184,6 +184,7 @@ class TitanEmbedder(BaseEmbedder):
         cache: EmbeddingCache | None = None,
         max_chars: int = 40000,
         profile: str | None = None,
+        endpoint_url: str | None = None,
         client=None,
         max_retries: int = 8,
         sleep: Callable[[float], None] = time.sleep,
@@ -200,6 +201,7 @@ class TitanEmbedder(BaseEmbedder):
         self._sleep = sleep
         self.cache_tag = f"titan|{model_id}|{self.dim}|{normalize}"
         self._profile, self._region, self._workers = profile, region, workers
+        self._endpoint_url = endpoint_url  # e.g. a bedrock-runtime VPC endpoint URL
         self._client_lock = threading.Lock()
         self._can_rebuild = client is None
         self.client = client if client is not None else self._build_client()
@@ -212,6 +214,7 @@ class TitanEmbedder(BaseEmbedder):
         return session.client(
             "bedrock-runtime",
             region_name=self._region,
+            endpoint_url=self._endpoint_url,
             config=Config(
                 max_pool_connections=max(10, self._workers * 2),
                 read_timeout=60,
@@ -292,5 +295,6 @@ def make_embedder(cfg: dict) -> BaseEmbedder:
             cache=cache,
             max_chars=int(e.get("max_chars", 40000)),
             profile=e.get("profile"),
+            endpoint_url=e.get("endpoint_url"),
         )
     raise ValueError(f"unknown embedder type '{kind}'")
